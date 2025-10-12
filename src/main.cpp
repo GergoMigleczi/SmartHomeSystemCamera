@@ -42,7 +42,7 @@ void logStatus(const char* message);
 void setup() {
   // Initialize debug serial (USB)
   Serial.begin(115200);
-  Serial.println("\n=== ESP32 Camera Board Starting ===");
+  logStatus("\n=== ESP32 Camera Board Starting ===");
   
   // Initialize UART for communication with main board
   MainBoardSerial.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
@@ -112,7 +112,7 @@ bool initializeCamera() {
   // Initialize camera
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x\n", err);
+    logStatusf("Camera init failed with error 0x%x\n", err);
     return false;
   }
   
@@ -176,12 +176,12 @@ camera_fb_t* captureImage() {
   camera_fb_t* fb = esp_camera_fb_get();
   
   if (!fb) {
-    Serial.println("Camera capture failed");
+    logStatus("Camera capture failed");
     sendErrorResponse();
     return NULL;
   }
   
-  Serial.printf("Image captured: %d bytes, %dx%d\n", 
+  logStatusf("Image captured: %d bytes, %dx%d\n", 
                 fb->len, fb->width, fb->height);
   
   return fb;
@@ -233,7 +233,7 @@ void sendImageData(camera_fb_t* fb) {
   // Send end marker
   MainBoardSerial.write(RESPONSE_END);
   
-  Serial.printf("Sent %d bytes to main board\n", bytesSent);
+  logStatusf("Sent %d bytes to main board\n", bytesSent);
 }
 
 // -----------------------------------------------------
@@ -241,13 +241,26 @@ void sendImageData(camera_fb_t* fb) {
 // -----------------------------------------------------
 void sendErrorResponse() {
   MainBoardSerial.write(RESPONSE_ERROR);
-  Serial.println("Error response sent to main board");
+  logStatus("Error response sent to main board");
 }
 
 // -----------------------------------------------------
 // Log status message to debug serial
 // -----------------------------------------------------
+// Simple version - just a message
 void logStatus(const char* message) {
   Serial.print("[CAM] ");
-  Serial.println(message);
+  logStatus(message);
+}
+
+// Formatted version - with printf-style formatting
+void logStatusf(const char* format, ...) {
+  char buffer[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+  
+  Serial.print("[CAM] ");
+  logStatus(buffer);
 }
