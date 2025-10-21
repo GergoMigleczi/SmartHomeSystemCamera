@@ -5,16 +5,8 @@
 #include <UniversalTelegramBot.h>
 #include "camera_pins.h"            // Pin definitions for your ESP32-CAM module
 
-// Global objects for network and Telegram bot communication
-WiFiClientSecure client;            // Secure WiFi client for HTTPS
-UniversalTelegramBot bot(TELEGRAM_TOKEN, client);  // Telegram bot instance
-
 // Variables for Telegram photo upload (optional advanced handling)
 static camera_fb_t *telegram_fb = nullptr;
-static size_t telegram_index = 0;
-
-// Telegram API server host
-const char* telegramHost = "api.telegram.org";
 
 // GPIO pin for flash LED (specific to AI Thinker ESP32-CAM)
 #define FLASH_LED_PIN 4
@@ -29,13 +21,18 @@ const char CAPTURE_CMD = 'C';           // Command to trigger capture
 const char RESPONSE_START = 'S';        // Start of image transmission
 const char RESPONSE_END = 'E';          // End of image transmission
 const char RESPONSE_ERROR = 'X';   
+const char RESPONSE_ACK = 'A';  // Acknowledgment
+
 
 // ==== Global State ====
 HardwareSerial MainBoardSerial(2); // Error during capture
 
 // --- Function declarations ---
+void flashCameraLED(int flashes, int onTime = 100, int offTime = 100);
 camera_fb_t* captureImage();
-void sendPhotoToTelegram(camera_fb_t* fb);
+void sendImageOverUART(camera_fb_t *fb);
+void logStatus(const char* message);
+void logStatusf(const char* format, ...);
 
 // -----------------------------------------------------
 // Setup function
@@ -44,20 +41,9 @@ void sendPhotoToTelegram(camera_fb_t* fb);
 void setup() {
   Serial.begin(115200);
   MainBoardSerial.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-  
-  // Connect to Wi-Fi
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nConnected to Wi-Fi!");
 
   // Configure flash LED pin
   pinMode(FLASH_LED_PIN, OUTPUT);
-
-  // Skip SSL certificate verification (Telegram uses HTTPS)
-  client.setInsecure(); 
 
   // --- Configure camera settings ---
   camera_config_t config;
@@ -95,18 +81,12 @@ void setup() {
 
   // Initialise the camera
   if (esp_camera_init(&config) != ESP_OK) {
-    Serial.println("Camera initialisation failed!");
+    logStatus("Camera initialisation failed!");
     return;
   }
 
   Serial.println("Camera initialised successfully!");
-  digitalWrite(FLASH_LED_PIN, HIGH);  // Turn flash ON for lighting
-  delay(100);                         // Short delay for exposure
-  digitalWrite(FLASH_LED_PIN, LOW);
-  delay(100);  
-  digitalWrite(FLASH_LED_PIN, HIGH);  // Turn flash ON for lighting
-  delay(100);                         // Short delay for exposure
-  digitalWrite(FLASH_LED_PIN, LOW);
+  flashCameraLED(2);  
 }
 
 
@@ -119,17 +99,30 @@ void loop() {
   if (MainBoardSerial.available() > 0) {
     char command = MainBoardSerial.read();
     
+    logStatus("Received command from main board");
     if (command == CAPTURE_CMD) {
       camera_fb_t *fb = captureImage();
 
+      // Send captured image over UART to main board
+      sendImageOverUART(fb);
+
       // Send captured photo to Telegram via raw HTTP POST
-      sendPhotoToTelegram(fb);
+      //sendPhotoToTelegram(fb);
     }
   }
 
   delay(50);
 }
 
+
+void flashCameraLED(int flashes, int onTime, int offTime) {
+  for (int i = 0; i < flashes; i++) {
+    digitalWrite(FLASH_LED_PIN, HIGH);  // Turn flash ON
+    delay(onTime);                      // Keep it ON for exposure
+    digitalWrite(FLASH_LED_PIN, LOW);   // Turn flash OFF
+    delay(offTime);                     // Pause before next flash
+  }
+}
 
 // -----------------------------------------------------
 // Capture image from camera
@@ -145,75 +138,94 @@ camera_fb_t* captureImage() {
   digitalWrite(FLASH_LED_PIN, LOW);   // Turn flash OFF
 
   if (!fb) {
-    Serial.println("Camera capture failed!");
+    logStatus("Camera capture failed!");
     return NULL;
   }
 
   // Log image size and resolution
-  Serial.printf("Image captured: %d bytes, %dx%d\n", 
+  Serial.printf("[CAM] Image captured: %d bytes, %dx%d\n", 
                 fb->len, fb->width, fb->height);
 
   return fb;
 }
 
-
 // -----------------------------------------------------
-// Send photo to Telegram using raw HTTPS POST
-// Responsibility: Upload JPEG image to Telegram Bot API
+// Send image over UART
+// Responsibility: send captured image to main board via UART
 // Parameters: fb = camera frame buffer containing JPEG image
 // -----------------------------------------------------
-void sendPhotoToTelegram(camera_fb_t* fb) {
-
+void sendImageOverUART(camera_fb_t *fb) {
   if (!fb) {
-    Serial.println("Camera capture failed - no frame buffer");
+    MainBoardSerial.write(RESPONSE_ERROR);
+    logStatus("❌ No frame buffer, sending error marker");
     return;
   }
 
-  // Connect to Telegram API server
-  if (!client.connect(telegramHost, 443)) {
-    Serial.println("Connection to Telegram failed!");
-    esp_camera_fb_return(fb);
-    return;
+  // --- 1. Send start marker ---
+  MainBoardSerial.write(RESPONSE_START);
+
+  // --- 2. Send image size (4 bytes, little endian) ---
+  uint32_t imageSize = fb->len;
+  MainBoardSerial.write((uint8_t*)&imageSize, 4);
+
+  // --- 3. Send image data in chunks ---
+  const size_t CHUNK_SIZE = 128;  // safe UART buffer size
+  uint8_t *bufPtr = fb->buf;
+
+  for (uint32_t i = 0; i < imageSize; i += CHUNK_SIZE) {
+    size_t bytesToSend = min(CHUNK_SIZE, imageSize - i);
+    MainBoardSerial.write(bufPtr + i, bytesToSend);
+    MainBoardSerial.flush(); // ensure data is sent out
+
+    // --- Wait for ACK with timeout ---
+        const unsigned long TIMEOUT_MS = 5000; // 2 second per chunk
+        unsigned long startTime = millis();
+        bool ackReceived = false;
+
+        while (millis() - startTime < TIMEOUT_MS) {
+            if (MainBoardSerial.available() > 0) {
+                char ack = MainBoardSerial.read();
+                if (ack == RESPONSE_ACK) { // ACK
+                    ackReceived = true;
+                    break;
+                } else {
+                    logStatusf("⚠ Unexpected response: %c", ack);
+                }
+            }
+            delay(1); // small yield
+        }
+
+        if (!ackReceived) {
+            logStatusf("❌ Timeout waiting for ACK for chunk starting at %lu", i);
+            esp_camera_fb_return(fb);
+            return;
+        }
   }
 
-  // Define multipart/form-data boundary (used for file upload)
-  String boundary = "ESP32CAMBOUNDARY";
+  // --- 4. Send end marker ---
+  MainBoardSerial.write(RESPONSE_END);
 
-  // Build request headers and form body
-  String head = "--" + boundary + "\r\n"
-                "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n" +
-                TELEGRAM_CHAT_ID +
-                "\r\n--" + boundary + "\r\n"
-                "Content-Disposition: form-data; name=\"photo\"; filename=\"photo.jpg\"\r\n"
-                "Content-Type: image/jpeg\r\n\r\n";
-
-  String tail = "\r\n--" + boundary + "--\r\n";
-
-  // Calculate total content length
-  uint32_t imageLen = fb->len;
-  uint32_t totalLen = head.length() + imageLen + tail.length();
-
-  // --- Send HTTP POST request ---
-  client.printf("POST /bot%s/sendPhoto HTTP/1.1\r\n", TELEGRAM_TOKEN);
-  client.printf("Host: %s\r\n", telegramHost);
-  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
-  client.printf("Content-Length: %d\r\n\r\n", totalLen);
-
-  // Write form-data body
-  client.print(head);
-  client.write(fb->buf, imageLen);   // Send raw JPEG data
-  client.print(tail);
-
-  // Release the frame buffer memory
+  // --- 5. Free frame buffer ---
   esp_camera_fb_return(fb);
 
-  // --- Read Telegram server response (optional) ---
-  while (client.connected()) {
-    String line = client.readStringUntil('\n');
-    if (line == "\r") break; // End of headers
-  }
+  logStatusf("✅ Sent image (%lu bytes) to main board\n", imageSize);
+}
 
-  String response = client.readString();
-  Serial.println("Telegram response:");
-  Serial.println(response);
+// -----------------------------------------------------
+// Logging Functions
+// -----------------------------------------------------
+void logStatus(const char* message) {
+  Serial.print("[CAM] ");
+  Serial.println(message);
+}
+
+void logStatusf(const char* format, ...) {
+  char buffer[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+  
+  Serial.print("[CAM] ");
+  Serial.println(buffer);
 }
