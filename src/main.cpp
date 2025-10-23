@@ -22,6 +22,7 @@ const char RESPONSE_START = 'S';        // Start of image transmission
 const char RESPONSE_END = 'E';          // End of image transmission
 const char RESPONSE_ERROR = 'X';   
 const char RESPONSE_ACK = 'A';  // Acknowledgment
+const char BLINK_CMD = 'B'; 
 
 
 // ==== Global State ====
@@ -40,6 +41,9 @@ void logStatusf(const char* format, ...);
 // -----------------------------------------------------
 void setup() {
   Serial.begin(115200);
+
+  MainBoardSerial.setRxBufferSize(1024);  // increase RX buffer size
+  MainBoardSerial.setTxBufferSize(1024);  // increase TX buffer size
   MainBoardSerial.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 
   // Configure flash LED pin
@@ -75,7 +79,7 @@ void setup() {
   // Camera parameters
   config.xclk_freq_hz = 20000000;    // External clock frequency
   config.pixel_format = PIXFORMAT_JPEG;  // Output format (JPEG)
-  config.frame_size = FRAMESIZE_VGA;     // Resolution (640x480)
+  config.frame_size = FRAMESIZE_VGA;     // FRAMESIZE_VGA (640x480) FRAMESIZE_QVGA (320×240) or FRAMESIZE_CIF (400×296)
   config.jpeg_quality = 10;              // 0-63 (lower = better quality)
   config.fb_count = 1;                   // Number of frame buffers
 
@@ -99,7 +103,7 @@ void loop() {
   if (MainBoardSerial.available() > 0) {
     char command = MainBoardSerial.read();
     
-    logStatus("Received command from main board");
+    logStatusf("Received command from main board: %c", command);
     if (command == CAPTURE_CMD) {
       camera_fb_t *fb = captureImage();
 
@@ -108,7 +112,11 @@ void loop() {
 
       // Send captured photo to Telegram via raw HTTP POST
       //sendPhotoToTelegram(fb);
+    }else if (command == BLINK_CMD)
+    {
+      flashCameraLED(3, 300, 200);
     }
+    
   }
 
   delay(50);
@@ -169,7 +177,7 @@ void sendImageOverUART(camera_fb_t *fb) {
   MainBoardSerial.write((uint8_t*)&imageSize, 4);
 
   // --- 3. Send image data in chunks ---
-  const size_t CHUNK_SIZE = 128;  // safe UART buffer size
+  const size_t CHUNK_SIZE = 1024;  // safe UART buffer size
   uint8_t *bufPtr = fb->buf;
 
   for (uint32_t i = 0; i < imageSize; i += CHUNK_SIZE) {
@@ -178,28 +186,28 @@ void sendImageOverUART(camera_fb_t *fb) {
     MainBoardSerial.flush(); // ensure data is sent out
 
     // --- Wait for ACK with timeout ---
-        const unsigned long TIMEOUT_MS = 5000; // 2 second per chunk
-        unsigned long startTime = millis();
-        bool ackReceived = false;
+    const unsigned long TIMEOUT_MS = 15000; // 15 second per chunk
+    unsigned long startTime = millis();
+    bool ackReceived = false;
 
-        while (millis() - startTime < TIMEOUT_MS) {
-            if (MainBoardSerial.available() > 0) {
-                char ack = MainBoardSerial.read();
-                if (ack == RESPONSE_ACK) { // ACK
-                    ackReceived = true;
-                    break;
-                } else {
-                    logStatusf("⚠ Unexpected response: %c", ack);
-                }
+    while (millis() - startTime < TIMEOUT_MS) {
+        if (MainBoardSerial.available() > 0) {
+            char ack = MainBoardSerial.read();
+            if (ack == RESPONSE_ACK) { // ACK
+                ackReceived = true;
+                break;
+            } else {
+                logStatusf("⚠ Unexpected response: %c", ack);
             }
-            delay(1); // small yield
         }
+        delay(1); // small yield
+    }
 
-        if (!ackReceived) {
-            logStatusf("❌ Timeout waiting for ACK for chunk starting at %lu", i);
-            esp_camera_fb_return(fb);
-            return;
-        }
+    if (!ackReceived) {
+        logStatusf("❌ Timeout waiting for ACK for chunk starting at %lu", i);
+        esp_camera_fb_return(fb);
+        return;
+    }
   }
 
   // --- 4. Send end marker ---
